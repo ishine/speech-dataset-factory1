@@ -21,10 +21,10 @@ class AudioFileTooLargeError(Exception):
 #         Load Components         #
 # ----------------------------- #
 
-def load_model_and_tokenizer(model_name="/home/eri-2x4090/.cache/huggingface/hub/models--openai--whisper-large-v3/snapshots/06f233fe06e710322aca913c1bc4249a0d71fce1"):
+def load_model_and_tokenizer(model_name="/home/eri-3060/.cache/huggingface/hub/models--openai--whisper-large-v3/snapshots/06f233fe06e710322aca913c1bc4249a0d71fce1"):
     """Loads the Whisper model, processor, and tokenizer."""
     processor = WhisperProcessor.from_pretrained(model_name)
-    model = WhisperForConditionalGeneration.from_pretrained(model_name, attn_implementation="sdpa")
+    model = WhisperForConditionalGeneration.from_pretrained(model_name, torch_dtype=torch.float16, attn_implementation="sdpa")
     tokenizer = WhisperTokenizer.from_pretrained(model_name)
     return processor, model, tokenizer
 
@@ -303,6 +303,7 @@ def main(input_manifest_path, output_manifest_path, batch_size, save_iterations,
     print(f"Using device: {device}")
     processor, model, tokenizer = load_model_and_tokenizer()
     model = model.to(device)
+    model.eval()
 
     # Read existing output manifest to identify already processed files
     processed_audio_filepaths = set()
@@ -364,14 +365,15 @@ def main(input_manifest_path, output_manifest_path, batch_size, save_iterations,
 
                 # Process segments in batches
                 file_detection_results = []
-                for i in range(0, segments_waveform.shape[0], batch_size):
-                    batch_segments = segments_waveform[i:i + batch_size]
-                    
-                    inputs = processor(batch_segments.numpy(), sampling_rate=16000, return_tensors="pt")
-                    input_features = inputs.input_features.to(device)
-                    
-                    detection_results = detect_language(model, tokenizer, input_features)
-                    file_detection_results.extend(detection_results)
+                with torch.inference_mode():
+                    for i in range(0, segments_waveform.shape[0], batch_size):
+                        batch_segments = segments_waveform[i:i + batch_size]
+                        
+                        inputs = processor(batch_segments.numpy(), sampling_rate=16000, return_tensors="pt")
+                        input_features = inputs.input_features.to(device, dtype=torch.float16)
+                        
+                        detection_results = detect_language(model, tokenizer, input_features)
+                        file_detection_results.extend(detection_results)
                 
                 if file_detection_results:
                     all_detection_results_for_original_file.extend(file_detection_results)
