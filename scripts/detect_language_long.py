@@ -21,12 +21,33 @@ class AudioFileTooLargeError(Exception):
 #         Load Components         #
 # ----------------------------- #
 
-def load_model_and_tokenizer(model_name="/home/eri-3060/.cache/huggingface/hub/models--openai--whisper-large-v3/snapshots/06f233fe06e710322aca913c1bc4249a0d71fce1"):
-    """Loads the Whisper model, processor, and tokenizer."""
-    processor = WhisperProcessor.from_pretrained(model_name)
-    model = WhisperForConditionalGeneration.from_pretrained(model_name, torch_dtype=torch.float16, attn_implementation="sdpa")
-    tokenizer = WhisperTokenizer.from_pretrained(model_name)
-    return processor, model, tokenizer
+def load_model_and_tokenizer(model_name=None):
+    """Loads the Whisper model, processor, and tokenizer from a local path or Hugging Face."""
+    fallback_model_name = "openai/whisper-large-v3"
+    resolved_model_name = model_name or fallback_model_name
+
+    if model_name:
+        if os.path.exists(model_name):
+            print(f"Loading Whisper model from local path: {model_name}")
+        else:
+            print(f"Whisper model path '{model_name}' was not found. Falling back to Hugging Face: {fallback_model_name}")
+            resolved_model_name = fallback_model_name
+
+    try:
+        processor = WhisperProcessor.from_pretrained(resolved_model_name)
+        model = WhisperForConditionalGeneration.from_pretrained(
+            resolved_model_name,
+            torch_dtype=torch.float16,
+            attn_implementation="sdpa"
+        )
+        tokenizer = WhisperTokenizer.from_pretrained(resolved_model_name)
+        return processor, model, tokenizer
+    except Exception as e:
+        if resolved_model_name != fallback_model_name:
+            print(f"Failed to load Whisper model from local path '{resolved_model_name}': {e}")
+            print(f"Falling back to Hugging Face: {fallback_model_name}")
+            return load_model_and_tokenizer(fallback_model_name)
+        raise
 
 # ----------------------------- #
 #      Load and Preprocess       #
@@ -271,7 +292,7 @@ def split_audio_file(original_audio_path):
 #            Main               #
 # ----------------------------- #
 
-def main(input_manifest_path, output_manifest_path, batch_size, save_iterations, num_segments, min_segment_len, max_segment_len, rms_threshold):
+def main(input_manifest_path, output_manifest_path, batch_size, save_iterations, num_segments, min_segment_len, max_segment_len, rms_threshold, whisper_model_path=None):
     """Main function to run the language detection pipeline for long audio files."""
     # Load manifest data from JSON lines file
     manifest_data = []
@@ -301,7 +322,7 @@ def main(input_manifest_path, output_manifest_path, batch_size, save_iterations,
     # Load model components
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    processor, model, tokenizer = load_model_and_tokenizer()
+    processor, model, tokenizer = load_model_and_tokenizer(whisper_model_path)
     model = model.to(device)
     model.eval()
 
@@ -455,6 +476,7 @@ if __name__ == "__main__":
     parser.add_argument('--min_segment_len', type=int, default=10, help='Minimum length of an audio segment in seconds.')
     parser.add_argument('--max_segment_len', type=int, default=30, help='Maximum length of an audio segment in seconds.')
     parser.add_argument('--rms_threshold', type=float, default=0.01, help='RMS energy threshold for filtering speech segments. Segments with RMS below this value will be discarded.')
+    parser.add_argument('--whisper_model_path', type=str, default=None, help='Optional local path to a Whisper model directory. If not provided or not found, the script falls back to the Hugging Face model openai/whisper-large-v3.')
 
     args = parser.parse_args()
 
@@ -466,5 +488,6 @@ if __name__ == "__main__":
         num_segments=args.num_segments,
         min_segment_len=args.min_segment_len,
         max_segment_len=args.max_segment_len,
-        rms_threshold=args.rms_threshold
+        rms_threshold=args.rms_threshold,
+        whisper_model_path=args.whisper_model_path
     )
