@@ -111,17 +111,7 @@ def load_and_preprocess_audio_segments(audio_path, target_sample_rate=16000, num
                 if len(segments) >= num_segments:
                     break
 
-                # Check for overlap with already selected segments
-                is_overlapping = False
-                for prev_start, prev_end in selected_segments_info:
-                    # Check if the current potential segment (even a minimal one) would overlap with a selected segment
-                    if not (start_sample >= prev_end or start_sample + int(min_segment_len * target_sample_rate) <= prev_start):
-                        is_overlapping = True
-                        break
-                if is_overlapping:
-                    continue
-
-                # Determine segment duration
+                # Determine this segment's actual duration/end FIRST, before checking overlap
                 segment_duration = random.uniform(min_segment_len, max_segment_len)
                 segment_length_samples = int(segment_duration * target_sample_rate)
 
@@ -130,9 +120,18 @@ def load_and_preprocess_audio_segments(audio_path, target_sample_rate=16000, num
                 if end_sample > waveform.shape[0]:
                     end_sample = waveform.shape[0]
                     segment_length_samples = end_sample - start_sample
-                
+
                 # Ensure segment length is at least min_segment_len after adjustments
                 if segment_length_samples < int(min_segment_len * target_sample_rate):
+                    continue
+
+                # Check for overlap with already selected segments, using the REAL (start, end) range
+                is_overlapping = False
+                for prev_start, prev_end in selected_segments_info:
+                    if not (start_sample >= prev_end or end_sample <= prev_start):
+                        is_overlapping = True
+                        break
+                if is_overlapping:
                     continue
 
                 current_segment = waveform[start_sample:end_sample]
@@ -141,8 +140,7 @@ def load_and_preprocess_audio_segments(audio_path, target_sample_rate=16000, num
                 if calculate_rms(current_segment) > rms_threshold:
                     segments.append(current_segment)
                     selected_segments_info.append((start_sample, end_sample))
-                    selected_segments_info.sort() # Keep sorted for efficient overlap checking
-                # else:
+                    selected_segments_info.sort() # Keep sorted for efficient overlap checking                # else:
                     # print(f"Segment from {audio_path} (start={start_sample/target_sample_rate:.2f}s, end={end_sample/target_sample_rate:.2f}s) RMS below threshold.")
 
     except Exception as e:
