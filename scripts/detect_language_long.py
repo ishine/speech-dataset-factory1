@@ -63,6 +63,7 @@ def load_and_preprocess_audio_segments(audio_path, target_sample_rate=16000, num
     filters by RMS, and returns a list of waveforms for the valid segments.
     """
     segments = []
+    segments_meta = [] # Stores dicts with start/end (seconds) and rms for each selected segment
     try:
         audio = AudioSegment.from_file(audio_path)
         sr = audio.frame_rate
@@ -82,12 +83,18 @@ def load_and_preprocess_audio_segments(audio_path, target_sample_rate=16000, num
 
         if audio_len_seconds < min_segment_len:
             print(f"Skipping {audio_path}: audio too short ({audio_len_seconds:.2f}s) for min segment length of {min_segment_len}s.")
-            return None
+            return None, None
 
         if audio_len_seconds <= max_segment_len:
             # If audio is within or shorter than max_segment_len, take the whole audio
-            if calculate_rms(waveform) > rms_threshold:
+            whole_audio_rms = calculate_rms(waveform)
+            if whole_audio_rms > rms_threshold:
                 segments.append(waveform)
+                segments_meta.append({
+                    "start": 0.0,
+                    "end": audio_len_seconds,
+                    "rms": whole_audio_rms.item()
+                })
             else:
                 print(f"Skipping {audio_path}: whole audio RMS below threshold.")
         else:
@@ -137,8 +144,14 @@ def load_and_preprocess_audio_segments(audio_path, target_sample_rate=16000, num
                 current_segment = waveform[start_sample:end_sample]
 
                 # RMS-based filtering
-                if calculate_rms(current_segment) > rms_threshold:
+                current_segment_rms = calculate_rms(current_segment)
+                if current_segment_rms > rms_threshold:
                     segments.append(current_segment)
+                    segments_meta.append({
+                        "start": start_sample / target_sample_rate,
+                        "end": end_sample / target_sample_rate,
+                        "rms": current_segment_rms.item()
+                    })
                     selected_segments_info.append((start_sample, end_sample))
                     selected_segments_info.sort() # Keep sorted for efficient overlap checking                # else:
                     # print(f"Segment from {audio_path} (start={start_sample/target_sample_rate:.2f}s, end={end_sample/target_sample_rate:.2f}s) RMS below threshold.")
@@ -148,11 +161,11 @@ def load_and_preprocess_audio_segments(audio_path, target_sample_rate=16000, num
         if "Unable to process >4GB files" in error_message:
             raise AudioFileTooLargeError(f"File {audio_path} is too large: {error_message}")
         print(f"Failed to load or process {audio_path}: {e}")
-        return None
+        return None, None
     
     if not segments:
-        return None
-    return pad_waveforms(segments)
+        return None, None
+    return pad_waveforms(segments), segments_meta
 
 def pad_waveforms(waveforms):
     """Pads a list of waveforms to the same length and stacks them into a tensor."""
@@ -290,7 +303,7 @@ def split_audio_file(original_audio_path):
 #            Main               #
 # ----------------------------- #
 
-def main(input_manifest_path, output_manifest_path, batch_size, save_iterations, num_segments, min_segment_len, max_segment_len, rms_threshold, whisper_model_path=None):
+def main(input_manifest_path, output_manifest_path, batch_size, save_iterations, num_segments, min_segment_len, max_segment_len, rms_threshold, whisper_model_path=None, root_dir=None):
     """Main function to run the language detection pipeline for long audio files."""
     # Load manifest data from JSON lines file
     manifest_data = []
@@ -356,9 +369,10 @@ def main(input_manifest_path, output_manifest_path, batch_size, save_iterations,
     pbar = tqdm(audio_paths_to_process, desc="Audio Files")
 
     for audio_file_path in pbar:
-        current_audio_paths_to_process = [audio_file_path]
+        full_audio_path = os.path.join(root_dir, audio_file_path) if root_dir else audio_file_path
+        current_audio_paths_to_process = [full_audio_path]
         original_record = next((rec for rec in manifest_data if rec['audio_filepath'] == audio_file_path), None)
-        
+
         all_detection_results_for_original_file = []
         processed_successfully = False
 
@@ -370,7 +384,7 @@ def main(input_manifest_path, output_manifest_path, batch_size, save_iterations,
             idx += 1 # Move to the next path
 
             try:
-                segments_waveform = load_and_preprocess_audio_segments(
+                segments_waveform, segments_meta = load_and_preprocess_audio_segments(
                     current_path,
                     target_sample_rate=16000,
                     num_segments=num_segments,
@@ -387,11 +401,17 @@ def main(input_manifest_path, output_manifest_path, batch_size, save_iterations,
                 with torch.inference_mode():
                     for i in range(0, segments_waveform.shape[0], batch_size):
                         batch_segments = segments_waveform[i:i + batch_size]
+                        batch_meta = segments_meta[i:i + batch_size]
                         
                         inputs = processor(batch_segments.numpy(), sampling_rate=16000, return_tensors="pt")
                         input_features = inputs.input_features.to(device, dtype=torch.float16)
                         
                         detection_results = detect_language(model, tokenizer, input_features)
+                        # Attach the segment's start/end (seconds) and rms alongside its detection result
+                        for meta, result in zip(batch_meta, detection_results):
+                            result["start"] = meta["start"]
+                            result["end"] = meta["end"]
+                            result["rms"] = meta["rms"]
                         file_detection_results.extend(detection_results)
                 
                 if file_detection_results:
@@ -435,12 +455,25 @@ def main(input_manifest_path, output_manifest_path, batch_size, save_iterations,
             final_detected_lang = max(detected_langs_count, key=detected_langs_count.get) if detected_langs_count else None
             final_detected_lang_prob = aggregated_lang_probs.get(final_detected_lang, 0.0) if final_detected_lang else 0.0
 
+            # Build per-segment info (start, end, rms) alongside each segment's detected language and probability
+            selected_segments_summary = [
+                {
+                    "start": result.get("start"),
+                    "end": result.get("end"),
+                    "rms": result.get("rms"),
+                    "detected_lang": result["detected_lang"],
+                    "detected_lang_prob": result["detected_lang_prob"]
+                }
+                for result in all_detection_results_for_original_file
+            ]
+
             if original_record:
                 updated_record = original_record.copy()
                 updated_record.update({
                     "lang": final_detected_lang,
                     "lang_prob": final_detected_lang_prob,
-                    "all_lang_probs": aggregated_lang_probs
+                    "all_lang_probs": aggregated_lang_probs,
+                    "segments": selected_segments_summary
                 })
                 # Add duration if available in the original record
                 if 'duration' in original_record:
@@ -468,13 +501,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Perform language detection on long audio files by sampling segments.")
     parser.add_argument('--input_manifest', type=str, required=True, help='Path to the input manifest file (JSON lines).')
     parser.add_argument('--output_manifest', type=str, required=True, help='Path to save the output manifest file with language detection results.')
-    parser.add_argument('--batch_size', type=int, default=2, help='Batch size for processing segments.')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for processing segments.')
     parser.add_argument('--save_iterations', type=int, default=64, help='Save progress every N records. If 0, saves only at the end. (default: 0)')
     parser.add_argument('--num_segments', type=int, default=10, help='Number of random segments to extract from each long audio.')
-    parser.add_argument('--min_segment_len', type=int, default=10, help='Minimum length of an audio segment in seconds.')
-    parser.add_argument('--max_segment_len', type=int, default=30, help='Maximum length of an audio segment in seconds.')
+    parser.add_argument('--min_segment_len', type=int, default=5, help='Minimum length of an audio segment in seconds.')
+    parser.add_argument('--max_segment_len', type=int, default=20, help='Maximum length of an audio segment in seconds.')
     parser.add_argument('--rms_threshold', type=float, default=0.01, help='RMS energy threshold for filtering speech segments. Segments with RMS below this value will be discarded.')
     parser.add_argument('--whisper_model_path', type=str, default=None, help='Optional local path to a Whisper model directory. If not provided or not found, the script falls back to the Hugging Face model openai/whisper-large-v3.')
+    parser.add_argument('--root_dir', type=str, default=None, help='Root directory to prepend to each relative audio_filepath in the input manifest when loading audio. Output manifest still stores the original relative paths.')
 
     args = parser.parse_args()
 
@@ -487,5 +521,6 @@ if __name__ == "__main__":
         min_segment_len=args.min_segment_len,
         max_segment_len=args.max_segment_len,
         rms_threshold=args.rms_threshold,
-        whisper_model_path=args.whisper_model_path
+        whisper_model_path=args.whisper_model_path,
+        root_dir=args.root_dir
     )
